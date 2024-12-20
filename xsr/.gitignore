@@ -1,0 +1,2 @@
+# omit Go vendor directories
+vendor/
