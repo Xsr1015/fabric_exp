@@ -23,6 +23,9 @@ target
 .classpath
 .settings
 
+# Log file
+*.log
+
 # installed Fabric binaries etc.
 /bin/
 builders/

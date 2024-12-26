@@ -37,68 +37,23 @@ type Stake struct {
 }
 
 type Transaction struct {
-	TXID      string          `json:"txid"`
-	Seller    string          `json:"seller"`
-	Buyer     string          `json:"buyer"`
-	DataHash  string          `json:"datahash"`
-	Money     int             `json:"money"`
-	SecretKey *rsa.PrivateKey `json:"secretkey"`
-	MoneyLock string          `json:"moneylock"` //An encrypted string of the "TRUE"
-	Flag1     bool            `json:"flag1"`     //Whether Seller wants to withdraw the tx
-	Flag2     bool            `json:"flag2"`     //Whether Buyer wants to withdraw the tx
-	Finished  bool            `json:"finished"`  //Whether the tx is finished
-}
-
-// MarshalJSON 自定义序列化方法，将 rsa.PrivateKey 转为 PEM 格式字符串
-func (t *Transaction) MarshalJSON() ([]byte, error) {
-	type Alias Transaction // 防止无限递归
-	if t.SecretKey != nil {
-		privBytes := x509.MarshalPKCS1PrivateKey(t.SecretKey)
-		privPem := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: privBytes})
-		t.SecretKey = nil // 将私钥置为 nil，防止它出现在 JSON 输出中
-		return json.Marshal(&struct {
-			SecretKey string `json:"secretkey"`
-			*Alias
-		}{
-			SecretKey: string(privPem),
-			Alias:     (*Alias)(t),
-		})
-	}
-	return json.Marshal(t)
-}
-
-// UnmarshalJSON 自定义反序列化方法，将 PEM 格式的私钥字符串解析回 rsa.PrivateKey
-func (t *Transaction) UnmarshalJSON(data []byte) error {
-	type Alias Transaction // 防止无限递归
-	aux := &struct {
-		SecretKey string `json:"secretkey"`
-		*Alias
-	}{
-		Alias: (*Alias)(t),
-	}
-	if err := json.Unmarshal(data, aux); err != nil {
-		return err
-	}
-
-	if aux.SecretKey != "" {
-		block, _ := pem.Decode([]byte(aux.SecretKey))
-		if block == nil {
-			return fmt.Errorf("failed to decode PEM block containing the private key")
-		}
-		priv, err := x509.ParsePKCS1PrivateKey(block.Bytes)
-		if err != nil {
-			return fmt.Errorf("failed to parse private key: %v", err)
-		}
-		t.SecretKey = priv
-	}
-	return nil
+	TXID      string `json:"txid"`
+	Seller    string `json:"seller"`
+	Buyer     string `json:"buyer"`
+	DataHash  string `json:"datahash"`
+	Money     int    `json:"money"`
+	SecretKey string `json:"secretkey"` //pem encoded string of the private key
+	MoneyLock string `json:"moneylock"` //An encrypted string of the "TRUE"
+	Flag1     bool   `json:"flag1"`     //Whether Seller wants to withdraw the tx
+	Flag2     bool   `json:"flag2"`     //Whether Buyer wants to withdraw the tx
+	Finished  bool   `json:"finished"`  //Whether the tx is finished
 }
 
 // InitLedger adds a base set of accounts to the ledger
 func (s *SmartContract) InitLedger(ctx contractapi.TransactionContextInterface) error {
 	accounts := []Account{
-		{ID: "account1", Owner: "Seller", Amount: 1000, Mortgage: 0},
-		{ID: "account2", Owner: "Buyer", Amount: 1000, Mortgage: 0},
+		{ID: "account1", Owner: "Seller", Amount: 100000, Mortgage: 0},
+		{ID: "account2", Owner: "Buyer", Amount: 100000, Mortgage: 0},
 	}
 
 	for _, account := range accounts {
@@ -113,6 +68,7 @@ func (s *SmartContract) InitLedger(ctx contractapi.TransactionContextInterface) 
 		}
 	}
 
+	ctx.GetStub().SetEvent("InitLedger", nil)
 	return nil
 }
 
@@ -287,7 +243,7 @@ func (s *SmartContract) Stake(ctx contractapi.TransactionContextInterface, id st
 	if err != nil {
 		return fmt.Errorf("failed to put to world state. %v", err)
 	}
-	ctx.GetStub().SetEvent("Stake", stakeJSON)
+	ctx.GetStub().SetEvent(id+"Stake", stakeJSON)
 	return nil
 }
 
@@ -321,7 +277,7 @@ func (s *SmartContract) ReturnStake(ctx contractapi.TransactionContextInterface,
 		if err != nil {
 			return fmt.Errorf("failed to put to world state. %v", err)
 		}
-		ctx.GetStub().SetEvent("ReturnStake", stakeJSON)
+		ctx.GetStub().SetEvent(id+"ReturnStake", stakeJSON)
 		return nil
 	}
 	// 更新状态
@@ -376,6 +332,9 @@ func (s *SmartContract) ConfirmReturnStake(ctx contractapi.TransactionContextInt
 	if err != nil {
 		return err
 	}
+	if stake.Returned {
+		return fmt.Errorf("Stake already returned")
+	}
 	stake.Flag2 = true
 	if !stake.Flag1 {
 		stakeJSON, err = json.Marshal(stake) //to update Flag2
@@ -386,7 +345,7 @@ func (s *SmartContract) ConfirmReturnStake(ctx contractapi.TransactionContextInt
 		if err != nil {
 			return fmt.Errorf("failed to put to world state. %v", err)
 		}
-		ctx.GetStub().SetEvent("ConfirmReturnStake", stakeJSON)
+		ctx.GetStub().SetEvent(id+"ConfirmReturnStake", stakeJSON)
 		return nil
 	}
 	// 更新状态
@@ -441,7 +400,7 @@ func (s *SmartContract) CreateTransaction(ctx contractapi.TransactionContextInte
 		Buyer:     buyer,
 		DataHash:  datahash,
 		Money:     0,
-		SecretKey: nil,
+		SecretKey: "",
 		MoneyLock: "",
 		Flag1:     false,
 		Flag2:     false,
@@ -552,7 +511,7 @@ func (s *SmartContract) GetMoney(ctx contractapi.TransactionContextInterface, id
 	if string(decryptedData) != "TRUE" {
 		return fmt.Errorf("the secret key is wrong")
 	}
-	tx.SecretKey = sk
+	tx.SecretKey = secretkey
 	tx.Money = 0
 	tx.Finished = true
 	var account Account
@@ -582,25 +541,271 @@ func (s *SmartContract) GetMoney(ctx contractapi.TransactionContextInterface, id
 }
 
 // GetSecretKey get the secret key of the transaction
-func (s *SmartContract) GetSecretKey(ctx contractapi.TransactionContextInterface, txid string) ([]byte, error) {
+func (s *SmartContract) GetSecretKey(ctx contractapi.TransactionContextInterface, txid string) (string, error) {
 	txjson, err := ctx.GetStub().GetState(txid)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read from world state: %v", err)
+		return "", fmt.Errorf("failed to read from world state: %v", err)
 	}
 	if txjson == nil {
-		return nil, fmt.Errorf("the transaction %s does not exist", txid)
+		return "", fmt.Errorf("the transaction %s does not exist", txid)
 	}
 	var tx Transaction
 	err = json.Unmarshal(txjson, &tx)
 	if err != nil {
-		return nil, fmt.Errorf("unmarshal tx err. %v", err)
+		return "", fmt.Errorf("unmarshal tx err. %v", err)
 	}
-	if tx.SecretKey == nil {
-		return nil, fmt.Errorf("the secret key is not set")
+	if tx.SecretKey == "" {
+		return "", fmt.Errorf("the secret key is not set")
 	}
-	privBytes := x509.MarshalPKCS1PrivateKey(tx.SecretKey)
-	privPem := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: privBytes})
-	return privPem, nil
+	return tx.SecretKey, nil
+}
+
+// WithdrawTx withdraw the transaction if both seller and buyer agree
+func (s *SmartContract) WithdrawTx(ctx contractapi.TransactionContextInterface, id string, txid string) error {
+	txjson, err := ctx.GetStub().GetState(txid)
+	if err != nil {
+		return fmt.Errorf("failed to read from world state: %v", err)
+	}
+	if txjson == nil {
+		return fmt.Errorf("the transaction %s does not exist", txid)
+	}
+	var tx Transaction
+	err = json.Unmarshal(txjson, &tx)
+	if err != nil {
+		return fmt.Errorf("unmarshal tx err. %v", err)
+	}
+	if tx.Finished {
+		return fmt.Errorf("the transaction is finished")
+	}
+	accountJSONs, err := ctx.GetStub().GetState(tx.Seller)
+	if err != nil {
+		return fmt.Errorf("failed to read from world state: %v", err)
+	}
+	if accountJSONs == nil {
+		return fmt.Errorf("the account %s does not exist", tx.Seller)
+	}
+	accountJSONb, err := ctx.GetStub().GetState(tx.Buyer)
+	if err != nil {
+		return fmt.Errorf("failed to read from world state: %v", err)
+	}
+	if accountJSONb == nil {
+		return fmt.Errorf("the account %s does not exist", tx.Buyer)
+	}
+
+	if tx.Seller == id {
+		tx.Flag1 = true
+	} else if tx.Buyer == id {
+		tx.Flag2 = true
+	}
+	if tx.Flag1 && tx.Flag2 {
+		tx.Finished = true
+		// give the money back to the buyer
+		var accountb Account
+		err = json.Unmarshal(accountJSONb, &accountb)
+		if err != nil {
+			return fmt.Errorf("unmarshal account err. %v", err)
+		}
+		accountb.Amount += tx.Money
+		tx.Money = 0
+		//return the stake of both seller and buyer
+		stakeJSONs, err := ctx.GetStub().GetState(tx.Seller + "-stake")
+		if err != nil {
+			return fmt.Errorf("failed to read from world state: %v", err)
+		}
+		stakeJSONb, err := ctx.GetStub().GetState(tx.Buyer + "-stake")
+		if err != nil {
+			return fmt.Errorf("failed to read from world state: %v", err)
+		}
+		var stakes Stake
+		err = json.Unmarshal(stakeJSONs, &stakes)
+		if err != nil {
+			return fmt.Errorf("unmarshal stake err. %v", err)
+		}
+		var stakeb Stake
+		err = json.Unmarshal(stakeJSONb, &stakeb)
+		if err != nil {
+			return fmt.Errorf("unmarshal stake err. %v", err)
+		}
+		var accounts Account
+		err = json.Unmarshal(accountJSONs, &accounts)
+		if err != nil {
+			return fmt.Errorf("unmarshal account err. %v", err)
+		}
+		stakes.Returned = true
+		stakeb.Returned = true
+		accounts.Amount += stakes.Amount
+		accounts.Mortgage -= stakes.Amount
+		accountb.Amount += stakeb.Amount
+		accountb.Mortgage -= stakeb.Amount
+		stakeJSONs, err = json.Marshal(stakes)
+		if err != nil {
+			return fmt.Errorf("marshal stake err. %v", err)
+		}
+		stakeJSONb, err = json.Marshal(stakeb)
+		if err != nil {
+			return fmt.Errorf("marshal stake err. %v", err)
+		}
+		err = ctx.GetStub().PutState(tx.Seller+"-stake", stakeJSONs)
+		if err != nil {
+			return fmt.Errorf("failed to put to world state. %v", err)
+		}
+		err = ctx.GetStub().PutState(tx.Buyer+"-stake", stakeJSONb)
+		if err != nil {
+			return fmt.Errorf("failed to put to world state. %v", err)
+		}
+
+		txjson, err = json.Marshal(tx)
+		if err != nil {
+			return fmt.Errorf("marshal tx err. %v", err)
+		}
+		err = ctx.GetStub().PutState(txid, txjson)
+		if err != nil {
+			return fmt.Errorf("failed to put to world state. %v", err)
+		}
+		accountJSONs, err = json.Marshal(accounts)
+		if err != nil {
+			return fmt.Errorf("marshal account err. %v", err)
+		}
+		accountJSONb, err = json.Marshal(accountb)
+		if err != nil {
+			return fmt.Errorf("marshal account err. %v", err)
+		}
+		err = ctx.GetStub().PutState(tx.Buyer, accountJSONb)
+		if err != nil {
+			return fmt.Errorf("failed to put to world state. %v", err)
+		}
+		err = ctx.GetStub().PutState(tx.Seller, accountJSONs)
+		if err != nil {
+			return fmt.Errorf("failed to put to world state. %v", err)
+		}
+		ctx.GetStub().SetEvent("WithdrawTx", txjson)
+	} else {
+		txjson, err = json.Marshal(tx)
+		if err != nil {
+			return fmt.Errorf("marshal tx err. %v", err)
+		}
+		err = ctx.GetStub().PutState(txid, txjson)
+		if err != nil {
+			return fmt.Errorf("failed to put to world state. %v", err)
+		}
+		ctx.GetStub().SetEvent(id+"WithdrawTx", txjson)
+	}
+	return nil
+}
+
+// WithdrawTxUnilateral withdraw the transaction unilaterally
+func (s *SmartContract) WithdrawTxUnilateral(ctx contractapi.TransactionContextInterface, txid string) error {
+	txjson, err := ctx.GetStub().GetState(txid)
+	if err != nil {
+		return fmt.Errorf("failed to read from world state: %v", err)
+	}
+	if txjson == nil {
+		return fmt.Errorf("the transaction %s does not exist", txid)
+	}
+	var tx Transaction
+	err = json.Unmarshal(txjson, &tx)
+	if err != nil {
+		return fmt.Errorf("unmarshal tx err. %v", err)
+	}
+	if tx.Finished {
+		return fmt.Errorf("the transaction is finished")
+	}
+	accountJSONs, err := ctx.GetStub().GetState(tx.Seller)
+	if err != nil {
+		return fmt.Errorf("failed to read from world state: %v", err)
+	}
+	if accountJSONs == nil {
+		return fmt.Errorf("the account %s does not exist", tx.Seller)
+	}
+	accountJSONb, err := ctx.GetStub().GetState(tx.Buyer)
+	if err != nil {
+		return fmt.Errorf("failed to read from world state: %v", err)
+	}
+	if accountJSONb == nil {
+		return fmt.Errorf("the account %s does not exist", tx.Buyer)
+	}
+	tx.Finished = true
+	// give the money back to the buyer
+	var accountb Account
+	err = json.Unmarshal(accountJSONb, &accountb)
+	if err != nil {
+		return fmt.Errorf("unmarshal account err. %v", err)
+	}
+	accountb.Amount += tx.Money
+	tx.Money = 0
+	//return the stake of both seller and buyer
+	stakeJSONs, err := ctx.GetStub().GetState(tx.Seller + "-stake")
+	if err != nil {
+		return fmt.Errorf("failed to read from world state: %v", err)
+	}
+	stakeJSONb, err := ctx.GetStub().GetState(tx.Buyer + "-stake")
+	if err != nil {
+		return fmt.Errorf("failed to read from world state: %v", err)
+	}
+	var stakes Stake
+	err = json.Unmarshal(stakeJSONs, &stakes)
+	if err != nil {
+		return fmt.Errorf("unmarshal stake err. %v", err)
+	}
+	var stakeb Stake
+	err = json.Unmarshal(stakeJSONb, &stakeb)
+	if err != nil {
+		return fmt.Errorf("unmarshal stake err. %v", err)
+	}
+	var accounts Account
+	err = json.Unmarshal(accountJSONs, &accounts)
+	if err != nil {
+		return fmt.Errorf("unmarshal account err. %v", err)
+	}
+	stakes.Returned = true
+	stakeb.Returned = true
+	accounts.Amount += stakes.Amount
+	accounts.Mortgage -= stakes.Amount
+	accountb.Amount += stakeb.Amount
+	accountb.Mortgage -= stakeb.Amount
+	stakeJSONs, err = json.Marshal(stakes)
+	if err != nil {
+		return fmt.Errorf("marshal stake err. %v", err)
+	}
+	stakeJSONb, err = json.Marshal(stakeb)
+	if err != nil {
+		return fmt.Errorf("marshal stake err. %v", err)
+	}
+	err = ctx.GetStub().PutState(tx.Seller+"-stake", stakeJSONs)
+	if err != nil {
+		return fmt.Errorf("failed to put to world state. %v", err)
+	}
+	err = ctx.GetStub().PutState(tx.Buyer+"-stake", stakeJSONb)
+	if err != nil {
+		return fmt.Errorf("failed to put to world state. %v", err)
+	}
+
+	txjson, err = json.Marshal(tx)
+	if err != nil {
+		return fmt.Errorf("marshal tx err. %v", err)
+	}
+	err = ctx.GetStub().PutState(txid, txjson)
+	if err != nil {
+		return fmt.Errorf("failed to put to world state. %v", err)
+	}
+	accountJSONs, err = json.Marshal(accounts)
+	if err != nil {
+		return fmt.Errorf("marshal account err. %v", err)
+	}
+	accountJSONb, err = json.Marshal(accountb)
+	if err != nil {
+		return fmt.Errorf("marshal account err. %v", err)
+	}
+	err = ctx.GetStub().PutState(tx.Buyer, accountJSONb)
+	if err != nil {
+		return fmt.Errorf("failed to put to world state. %v", err)
+	}
+	err = ctx.GetStub().PutState(tx.Seller, accountJSONs)
+	if err != nil {
+		return fmt.Errorf("failed to put to world state. %v", err)
+	}
+	ctx.GetStub().SetEvent("WithdrawTxUnilateral", txjson)
+	return nil
 }
 
 func (s *SmartContract) DeleteAllAssets(ctx contractapi.TransactionContextInterface) error {

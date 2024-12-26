@@ -1,6 +1,7 @@
 package main
 
 import (
+	"Seller/logger"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -12,6 +13,8 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"net"
+	"os"
 	"strconv"
 	"time"
 
@@ -24,28 +27,39 @@ import (
 const (
 	channelName   = "mychannel"
 	chaincodeName = "xsr"
+	logPath       = "../log/seller"
+	logLevel      = logger.TestLevel
 )
 
 func main() {
+	//log configuration
+	logger.SetOutput(logger.InfoLevel, logger.NewFileWriter(fmt.Sprintf("%s/node-info-%s.log", logPath, "Seller")))
+	logger.SetOutput(logger.DebugLevel, logger.NewFileWriter(fmt.Sprintf("%s/node-debug-%s.log", logPath, "Seller")))
+	logger.SetOutput(logger.WarnLevel, logger.NewFileWriter(fmt.Sprintf("%s/node-warn-%s.log", logPath, "Seller")))
+	logger.SetOutput(logger.ErrorLevel, logger.NewFileWriter(fmt.Sprintf("%s/node-error-%s.log", logPath, "Seller")))
+	logger.SetLevel(logger.Level(logLevel))
+
 	//generate key for transaction
 	sk, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		panic(fmt.Errorf("failed to generatekey: %w", err))
+		logger.Error.Printf("failed to generatekey: %w", err)
+		panic(err)
 	}
 	pk := &sk.PublicKey
+	pkBytes := x509.MarshalPKCS1PublicKey(pk)
+	pkPem := pem.EncodeToMemory(&pem.Block{Type: "RSA PUBLIC KEY", Bytes: pkBytes})
 	data := []byte("这是测试数据")
 	encryptedData, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, pk, data, nil)
 	if err != nil {
-		panic(fmt.Errorf("failed to encrypt: %w", err))
+		logger.Error.Printf("failed to encrypt: %w", err)
+		panic(err)
 	}
-	moneylock, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, pk, []byte("TRUE"), nil)
-	if err != nil {
-		panic(fmt.Errorf("failed to encrypt moneylock: %w", err))
-	}
-	moneylockBase64 := base64.StdEncoding.EncodeToString(moneylock)
+	encryptedDataBase64 := base64.StdEncoding.EncodeToString(encryptedData)
 	datahash := sha256.New()
 	datahash.Write(data)
 	datahashbytes := datahash.Sum(nil)
+
+	//connect to gateway
 	clientConnection := newGrpcConnection()
 	defer clientConnection.Close()
 
@@ -63,6 +77,7 @@ func main() {
 		client.WithCommitStatusTimeout(1*time.Minute),
 	)
 	if err != nil {
+		logger.Error.Printf("failed to connect to gateway: %v", err)
 		panic(err)
 	}
 	defer gateway.Close()
@@ -73,55 +88,64 @@ func main() {
 	// Context used for event listening
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
 	// Listen for events emitted by subsequent transactions
-	startChaincodeEventListening(ctx, network)
-	deleteAllAssets(contract)
-	time.Sleep(1 * time.Second)
-	initLedger(contract)
-	time.Sleep(1 * time.Second)
-	firstBlockNumber := stake(contract, "account1", 100)
-	time.Sleep(1 * time.Second)
-	returnStake(contract, "account1")
-	time.Sleep(1 * time.Second)
-	confirmReturnStake(contract, "account1")
-	time.Sleep(1 * time.Second)
-	createTransaction(contract, "tx1", "account1", "account2", string(datahashbytes))
-	time.Sleep(1 * time.Second)
-	payforTx(contract, "account2", "tx1", 100, moneylockBase64)
-	time.Sleep(1 * time.Second)
-	getMoney(contract, "account1", "tx1", sk)
-	time.Sleep(1 * time.Second)
-	skfromtx := getSecretKey(contract, "tx1")
-	if skfromtx == nil {
-		panic("failed to get sk")
-	}
-	decryptedData, err := rsa.DecryptOAEP(sha256.New(), rand.Reader, skfromtx, encryptedData, nil)
-	if err != nil {
-		panic(fmt.Errorf("failed to decrypt data: %w", err))
-	}
-	fmt.Print(string(decryptedData))
-	if string(decryptedData) == string(encryptedData) {
-		fmt.Printf("test approved!")
-	}
-	// Replay events from the block containing the first transaction
-	replayChaincodeEvents(ctx, network, firstBlockNumber)
-}
-
-func startChaincodeEventListening(ctx context.Context, network *client.Network) {
-	fmt.Println("\n*** Start chaincode event listening")
+	logger.Info.Printf("*** Start chaincode event listening\n")
 
 	events, err := network.ChaincodeEvents(ctx, chaincodeName)
 	if err != nil {
-		panic(fmt.Errorf("failed to start chaincode event listening: %w", err))
+		logger.Error.Printf("failed to start chaincode event listening: %w", err)
+		panic(err)
 	}
-
 	go func() {
 		for event := range events {
-			asset := formatJSON(event.Payload)
-			fmt.Printf("\n<-- Chaincode event received: %s - %s\n", event.EventName, asset)
+			switch event.EventName {
+			case "InitLedger":
+				logger.Info.Printf("<-- Chaincode event received: %s\n", event.EventName)
+				stake(contract, "account1", 100)
+			case "account2Stake":
+				asset := formatJSON(event.Payload)
+				logger.Info.Printf("<-- Chaincode event received: %s - %s\n", event.EventName, asset)
+				createTransaction(contract, "tx1", "account1", "account2", string(datahashbytes))
+			case "PayforTx":
+				asset := formatJSON(event.Payload)
+				logger.Info.Printf("<-- Chaincode event received: %s - %s\n", event.EventName, asset)
+				getMoney(contract, "account1", "tx1", sk)
+			default:
+				asset := formatJSON(event.Payload)
+				logger.Info.Printf("<-- Chaincode event received: %s - %s\n", event.EventName, asset)
+			}
 		}
 	}()
+	//tcp connection with buyer
+	listen, err := net.Listen("tcp", ":8080")
+	if err != nil {
+		logger.Error.Printf("Error starting server: %v", err)
+		os.Exit(1)
+	}
+	defer listen.Close()
+	conn, err := listen.Accept() //wait for buyer to connect
+	if err != nil {
+		logger.Error.Printf("Error accepting connection: %v", err)
+		panic(err)
+	}
+	go receiveMessages(conn)
+	deleteAllAssets(contract)
+	initLedger(contract)
+	encrypteddatamsg := Message{
+		Type:    EncryptedDataType,
+		Content: encryptedDataBase64,
+	}
+	sendMessageToBuyer(conn, encrypteddatamsg)
+	pkdatamsg := Message{
+		Type:    PublicKeyType,
+		Content: string(pkPem),
+	}
+	sendMessageToBuyer(conn, pkdatamsg)
+
+	for {
+	}
+	// Replay events from the block containing the first transaction
+	//replayChaincodeEvents(ctx, network, firstBlockNumber)
 }
 
 func formatJSON(data []byte) string {
@@ -133,7 +157,7 @@ func formatJSON(data []byte) string {
 }
 
 func initLedger(contract *client.Contract) {
-	fmt.Printf("\n--> Submit Transaction: InitLedger, function creates the initial set of accounts on the ledger \n")
+	fmt.Printf("--> Submit Transaction: InitLedger, function creates the initial set of accounts on the ledger \n")
 
 	_, err := contract.SubmitTransaction("InitLedger")
 	if err != nil {
@@ -143,30 +167,19 @@ func initLedger(contract *client.Contract) {
 	fmt.Printf("*** Transaction: InitLedger committed successfully\n")
 }
 
-func stake(contract *client.Contract, id string, amount int) uint64 {
-	fmt.Printf("\n--> Submit Transaction: Stake, owned by %s, amount = %d\n", id, amount)
-	_, commit, err := contract.SubmitAsync("Stake", client.WithArguments(id, strconv.Itoa(amount)))
+func stake(contract *client.Contract, id string, amount int) {
+	logger.Info.Printf("--> Submit Transaction: Stake, owned by %s, amount = %d\n", id, amount)
+	_, err := contract.SubmitTransaction("Stake", id, strconv.Itoa(amount))
 	if err != nil {
 		ErrorHandling(err)
 		panic(fmt.Errorf("failed to submit transaction Stake: %v", err))
 	}
 
-	status, err := commit.Status()
-	if err != nil {
-		panic(fmt.Errorf("failed to get transaction commit status: %v", err))
-	}
-
-	if !status.Successful {
-		panic(fmt.Errorf("failed to commit transaction with status code %v", status.Code))
-	}
-
-	fmt.Println("\n*** Transaction: Stake committed successfully")
-
-	return status.BlockNumber
+	logger.Info.Printf("*** Transaction: Stake committed successfully")
 }
 
 func returnStake(contract *client.Contract, id string) {
-	fmt.Printf("\n--> Submit Transaction: ReturnStake, stake owned by %s\n", id)
+	fmt.Printf("--> Submit Transaction: ReturnStake, stake owned by %s\n", id)
 	_, err := contract.SubmitTransaction("ReturnStake", id)
 	if err != nil {
 		ErrorHandling(err)
@@ -178,7 +191,7 @@ func returnStake(contract *client.Contract, id string) {
 }
 
 func confirmReturnStake(contract *client.Contract, id string) {
-	fmt.Printf("\n--> Submit Transaction: ConfirmReturnStake, stake owned by %s\n", id)
+	fmt.Printf("--> Submit Transaction: ConfirmReturnStake, stake owned by %s\n", id)
 	_, err := contract.SubmitTransaction("ConfirmReturnStake", id)
 	if err != nil {
 		ErrorHandling(err)
@@ -190,32 +203,20 @@ func confirmReturnStake(contract *client.Contract, id string) {
 }
 
 func createTransaction(contract *client.Contract, txid string, seller string, buyer string, datahash string) {
-	fmt.Printf("\n--> Submit Transaction: CreateTransaction, txid %s\n", txid)
+	logger.Info.Printf("--> Submit Transaction: CreateTransaction, txid %s\n", txid)
 	_, err := contract.SubmitTransaction("CreateTransaction", txid, seller, buyer, datahash)
 	if err != nil {
 		ErrorHandling(err)
 		panic(fmt.Errorf("failed to submit transaction CreateTransaction: %v", err))
 	}
 
-	fmt.Printf("*** Transaction: CreateTransaction committed successfully\n")
-}
-
-func payforTx(contract *client.Contract, id string, txid string, money int, moneylock string) {
-	fmt.Printf("\n--> Submit Transaction: PayforTx, txid %s\n", txid)
-	_, err := contract.SubmitTransaction("PayforTx", id, txid, strconv.Itoa(money), moneylock)
-	if err != nil {
-		ErrorHandling(err)
-		fmt.Printf("failed to submit transaction PayforTx: %v\n", err)
-		return
-	}
-
-	fmt.Printf("*** Transaction: PayforTx committed successfully\n")
+	logger.Info.Printf("*** Transaction: CreateTransaction committed successfully\n")
 }
 
 func getMoney(contract *client.Contract, id string, txid string, secretkey *rsa.PrivateKey) {
 	privBytes := x509.MarshalPKCS1PrivateKey(secretkey)
 	privPem := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: privBytes})
-	fmt.Printf("\n--> Submit Transaction: GetMoney, txid %s\n", txid)
+	logger.Info.Printf("--> Submit Transaction: GetMoney, txid %s\n", txid)
 	_, err := contract.SubmitTransaction("GetMoney", id, txid, string(privPem))
 	if err != nil {
 		ErrorHandling(err)
@@ -223,33 +224,11 @@ func getMoney(contract *client.Contract, id string, txid string, secretkey *rsa.
 		return
 	}
 
-	fmt.Printf("*** Transaction: GetMoney committed successfully\n")
-}
-
-func getSecretKey(contract *client.Contract, txid string) *rsa.PrivateKey {
-	fmt.Printf("\n--> Evaluate Transaction: GetSecretKey, txid %s\n", txid)
-	evaluateResult, err := contract.EvaluateTransaction("GetSecretKey", txid)
-	if err != nil {
-		fmt.Printf("failed to evaluate transaction GetSecretKey: %v\n", err)
-		return nil
-	}
-	block, _ := pem.Decode([]byte(evaluateResult))
-	if block == nil {
-		fmt.Printf("failed to decode PEM block containing the private key")
-		return nil
-	}
-	sk, err := x509.ParsePKCS1PrivateKey(block.Bytes)
-	if err != nil {
-		fmt.Printf("failed to parse private key: %v", err)
-		return nil
-	}
-
-	fmt.Printf("*** Transaction: GetSecretKey evaluate successfully\n")
-	return sk
+	logger.Info.Printf("*** Transaction: GetMoney committed successfully\n")
 }
 
 func deleteAllAssets(contract *client.Contract) {
-	fmt.Printf("\n--> Submit Transaction: DeleteAllAssets\n")
+	fmt.Printf("--> Submit Transaction: DeleteAllAssets\n")
 	_, err := contract.SubmitTransaction("DeleteAllAssets")
 	if err != nil {
 		ErrorHandling(err)
@@ -287,10 +266,11 @@ func replayChaincodeEvents(ctx context.Context, network *client.Network, startBl
 
 func ErrorHandling(err error) {
 	if err == nil {
+		logger.Error.Printf("******** FAILED to return an error")
 		panic("******** FAILED to return an error")
 	}
 
-	fmt.Println("*** Successfully caught the error:")
+	logger.Error.Printf("*** Successfully caught the error:")
 
 	var endorseErr *client.EndorseError
 	var submitErr *client.SubmitError
@@ -298,18 +278,19 @@ func ErrorHandling(err error) {
 	var commitErr *client.CommitError
 
 	if errors.As(err, &endorseErr) {
-		fmt.Printf("Endorse error for transaction %s with gRPC status %v: %s\n", endorseErr.TransactionID, status.Code(endorseErr), endorseErr)
+		logger.Error.Printf("Endorse error for transaction %s with gRPC status %v: %s\n", endorseErr.TransactionID, status.Code(endorseErr), endorseErr)
 	} else if errors.As(err, &submitErr) {
-		fmt.Printf("Submit error for transaction %s with gRPC status %v: %s\n", submitErr.TransactionID, status.Code(submitErr), submitErr)
+		logger.Error.Printf("Submit error for transaction %s with gRPC status %v: %s\n", submitErr.TransactionID, status.Code(submitErr), submitErr)
 	} else if errors.As(err, &commitStatusErr) {
 		if errors.Is(err, context.DeadlineExceeded) {
-			fmt.Printf("Timeout waiting for transaction %s commit status: %s", commitStatusErr.TransactionID, commitStatusErr)
+			logger.Error.Printf("Timeout waiting for transaction %s commit status: %s", commitStatusErr.TransactionID, commitStatusErr)
 		} else {
-			fmt.Printf("Error obtaining commit status for transaction %s with gRPC status %v: %s\n", commitStatusErr.TransactionID, status.Code(commitStatusErr), commitStatusErr)
+			logger.Error.Printf("Error obtaining commit status for transaction %s with gRPC status %v: %s\n", commitStatusErr.TransactionID, status.Code(commitStatusErr), commitStatusErr)
 		}
 	} else if errors.As(err, &commitErr) {
-		fmt.Printf("Transaction %s failed to commit with status %d: %s\n", commitErr.TransactionID, int32(commitErr.Code), err)
+		logger.Error.Printf("Transaction %s failed to commit with status %d: %s\n", commitErr.TransactionID, int32(commitErr.Code), err)
 	} else {
+		logger.Error.Printf("Unexpected error type %T: %v\n", err, err)
 		panic(fmt.Errorf("unexpected error type %T: %w", err, err))
 	}
 
@@ -319,12 +300,12 @@ func ErrorHandling(err error) {
 
 	details := statusErr.Details()
 	if len(details) > 0 {
-		fmt.Println("Error Details:")
+		logger.Error.Printf("Error Details:")
 
 		for _, detail := range details {
 			switch detail := detail.(type) {
 			case *gateway.ErrorDetail:
-				fmt.Printf("- address: %s; mspId: %s; message: %s\n", detail.Address, detail.MspId, detail.Message)
+				logger.Error.Printf("- address: %s; mspId: %s; message: %s\n", detail.Address, detail.MspId, detail.Message)
 			}
 		}
 	}
