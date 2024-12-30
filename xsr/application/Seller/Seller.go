@@ -4,6 +4,8 @@ import (
 	"Seller/logger"
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -16,11 +18,13 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/hyperledger/fabric-gateway/pkg/client"
 	"github.com/hyperledger/fabric-gateway/pkg/hash"
 	"github.com/hyperledger/fabric-protos-go-apiv2/gateway"
+	"github.com/klauspost/reedsolomon"
 	"google.golang.org/grpc/status"
 )
 
@@ -29,7 +33,14 @@ const (
 	chaincodeName = "xsr"
 	logPath       = "../log/seller"
 	logLevel      = logger.TestLevel
+	dataSize      = 1024 //bytes
+	keySize       = 2048 //bits
+	maxBlockSize  = 190  //最大可以加密的数据块大小
 )
+
+var sk *rsa.PrivateKey
+var pk *rsa.PublicKey
+var keyforsupervision []byte
 
 func main() {
 	//log configuration
@@ -39,25 +50,11 @@ func main() {
 	logger.SetOutput(logger.ErrorLevel, logger.NewFileWriter(fmt.Sprintf("%s/node-error-%s.log", logPath, "Seller")))
 	logger.SetLevel(logger.Level(logLevel))
 
-	//generate key for transaction
-	sk, err := rsa.GenerateKey(rand.Reader, 2048)
+	data, err := randomString(dataSize)
 	if err != nil {
-		logger.Error.Printf("failed to generatekey: %w", err)
+		logger.Error.Printf("failed to generate random data: %w", err)
 		panic(err)
 	}
-	pk := &sk.PublicKey
-	pkBytes := x509.MarshalPKCS1PublicKey(pk)
-	pkPem := pem.EncodeToMemory(&pem.Block{Type: "RSA PUBLIC KEY", Bytes: pkBytes})
-	data := []byte("这是测试数据")
-	encryptedData, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, pk, data, nil)
-	if err != nil {
-		logger.Error.Printf("failed to encrypt: %w", err)
-		panic(err)
-	}
-	encryptedDataBase64 := base64.StdEncoding.EncodeToString(encryptedData)
-	datahash := sha256.New()
-	datahash.Write(data)
-	datahashbytes := datahash.Sum(nil)
 
 	//connect to gateway
 	clientConnection := newGrpcConnection()
@@ -96,27 +93,8 @@ func main() {
 		logger.Error.Printf("failed to start chaincode event listening: %w", err)
 		panic(err)
 	}
-	go func() {
-		for event := range events {
-			switch event.EventName {
-			case "InitLedger":
-				logger.Info.Printf("<-- Chaincode event received: %s\n", event.EventName)
-				stake(contract, "account1", 100)
-			case "account2Stake":
-				asset := formatJSON(event.Payload)
-				logger.Info.Printf("<-- Chaincode event received: %s - %s\n", event.EventName, asset)
-				createTransaction(contract, "tx1", "account1", "account2", string(datahashbytes))
-			case "PayforTx":
-				asset := formatJSON(event.Payload)
-				logger.Info.Printf("<-- Chaincode event received: %s - %s\n", event.EventName, asset)
-				getMoney(contract, "account1", "tx1", sk)
-			default:
-				asset := formatJSON(event.Payload)
-				logger.Info.Printf("<-- Chaincode event received: %s - %s\n", event.EventName, asset)
-			}
-		}
-	}()
-	//tcp connection with buyer
+
+	// tcp connection with buyer
 	listen, err := net.Listen("tcp", ":8080")
 	if err != nil {
 		logger.Error.Printf("Error starting server: %v", err)
@@ -129,18 +107,102 @@ func main() {
 		panic(err)
 	}
 	go receiveMessages(conn)
+
+	go func() {
+		for event := range events {
+			switch event.EventName {
+			case "InitLedger":
+				logger.Info.Printf("<-- Chaincode event received: %s\n", event.EventName)
+				stake(contract, "account1", 100)
+			case "account2Stake":
+				asset := formatJSON(event.Payload)
+				logger.Info.Printf("<-- Chaincode event received: %s - %s\n", event.EventName, asset)
+
+				//generate key for transaction
+				logger.Info.Printf("data size: %d bytes\n", len(data))
+				logger.Info.Printf("Start to encrypt data\n")
+				sk, err = rsa.GenerateKey(rand.Reader, keySize)
+				if err != nil {
+					logger.Error.Printf("failed to generatekey: %w", err)
+					panic(err)
+				}
+				pk = &sk.PublicKey
+				pkBytes := x509.MarshalPKCS1PublicKey(pk)
+				pkPem := pem.EncodeToMemory(&pem.Block{Type: "RSA PUBLIC KEY", Bytes: pkBytes})
+				encryptedData, err := rsaEncryptChunks(pk, data)
+				if err != nil {
+					logger.Error.Printf("failed to encrypt: %w", err)
+					panic(err)
+				}
+				encryptedDataBase64 := base64.StdEncoding.EncodeToString(encryptedData)
+				if strings.Contains(encryptedDataBase64, "\x00") {
+					panic("Message contains null byte (\\x00)")
+				}
+				datahash := sha256.New()
+				datahash.Write(data)
+				datahashbytes := datahash.Sum(nil)
+				logger.Info.Printf("data encrypted\n")
+				encrypteddatamsg := Message{
+					Type:    EncryptedDataType,
+					Content: encryptedDataBase64,
+				}
+				pkdatamsg := Message{
+					Type:    PublicKeyType,
+					Content: string(pkPem),
+				}
+				sendMessageToBuyer(conn, pkdatamsg)
+				sendMessageToBuyer(conn, encrypteddatamsg)
+
+				createTransaction(contract, "tx1", "account1", "account2", string(datahashbytes))
+			case "PayforTx":
+				asset := formatJSON(event.Payload)
+				logger.Info.Printf("<-- Chaincode event received: %s - %s\n", event.EventName, asset)
+				//getMoney(contract, "account1", "tx1", sk)
+			case "account2WithdrawTx":
+				asset := formatJSON(event.Payload)
+				logger.Info.Printf("<-- Chaincode event received: %s - %s\n", event.EventName, asset)
+				withdrawTx(contract, "account1", "tx1")
+			case "WithdrawTx":
+				asset := formatJSON(event.Payload)
+				logger.Info.Printf("<-- Chaincode event received: %s - %s\n", event.EventName, asset)
+				logger.Info.Printf("Withdraw money successful")
+			case "WithdrawTxUnilateral":
+				asset := formatJSON(event.Payload)
+				logger.Info.Printf("<-- Chaincode event received: %s - %s\n", event.EventName, asset)
+				logger.Info.Printf("Withdraw money successful")
+			case "CreateSupervision":
+				asset := formatJSON(event.Payload)
+				logger.Info.Printf("<-- Chaincode event received: %s - %s\n", event.EventName, asset)
+				datapath := readSupervision(contract, "tx1-supervision")
+				if datapath == "" {
+					logger.Error.Printf("failed to read supervision")
+					panic("failed to read supervision")
+				}
+				encryptedDataforSupervision, err := os.ReadFile(datapath)
+				if err != nil {
+					logger.Error.Printf("failed to read data from file: %v", err)
+					panic(err)
+				}
+				decryptedDataforSupervision, err := aesDecrypt(string(encryptedDataforSupervision), keyforsupervision)
+				if err != nil {
+					logger.Error.Printf("failed to decrypt data for supervision: %v", err)
+					panic(err)
+				}
+				if decryptedDataforSupervision != string(data) {
+					logger.Error.Printf("data not match!")
+					panic("data not match")
+				}
+				reedsolomonEncode(keyforsupervision) //reed-solomon encode the key for supervision
+				logger.Info.Printf("normal situation finish")
+			default:
+				asset := formatJSON(event.Payload)
+				logger.Info.Printf("<-- Chaincode event received: %s - %s\n", event.EventName, asset)
+			}
+		}
+	}()
+
 	deleteAllAssets(contract)
 	initLedger(contract)
-	encrypteddatamsg := Message{
-		Type:    EncryptedDataType,
-		Content: encryptedDataBase64,
-	}
-	sendMessageToBuyer(conn, encrypteddatamsg)
-	pkdatamsg := Message{
-		Type:    PublicKeyType,
-		Content: string(pkPem),
-	}
-	sendMessageToBuyer(conn, pkdatamsg)
 
 	for {
 	}
@@ -154,6 +216,19 @@ func formatJSON(data []byte) string {
 		panic(fmt.Errorf("failed to parse JSON: %w", err))
 	}
 	return result.String()
+}
+
+func randomString(size int) ([]byte, error) {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, size)
+	_, err := rand.Read(b)
+	if err != nil {
+		return nil, err
+	}
+	for i := range b {
+		b[i] = charset[int(b[i])%len(charset)]
+	}
+	return b, nil
 }
 
 func initLedger(contract *client.Contract) {
@@ -237,6 +312,134 @@ func deleteAllAssets(contract *client.Contract) {
 	}
 
 	fmt.Printf("*** Transaction: DeleteAllAssets committed successfully\n")
+}
+
+func readSupervision(contract *client.Contract, txid string) string {
+	logger.Info.Printf("--> Evaluate Transaction: ReadSupervision, txid %s\n", txid)
+	result, err := contract.EvaluateTransaction("ReadSupervision", txid)
+	if err != nil {
+		logger.Error.Printf("failed to evaluate transaction ReadSupervision: %v\n", err)
+		return ""
+	}
+	logger.Info.Printf("*** Result: %s\n", result)
+	return string(result)
+}
+
+func withdrawTx(contract *client.Contract, id string, txid string) {
+	logger.Info.Printf("--> Submit Transaction: WithdrawTx, txid %s\n", txid)
+	_, err := contract.SubmitTransaction("WithdrawTx", id, txid)
+	if err != nil {
+		ErrorHandling(err)
+		fmt.Printf("failed to submit transaction WithdrawTx: %v\n", err)
+		return
+	}
+
+	logger.Info.Printf("*** Transaction: WithdrawTx committed successfully\n")
+}
+
+// 去除 PKCS7 填充
+func pkcs7Unpadding(data []byte) ([]byte, error) {
+	length := len(data)
+	if length == 0 {
+		return nil, fmt.Errorf("data length is zero")
+	}
+	padding := int(data[length-1])
+	if padding > length {
+		return nil, fmt.Errorf("invalid padding size")
+	}
+	return data[:length-padding], nil
+}
+
+// AES 解密
+func aesDecrypt(cipherText string, key []byte) (string, error) {
+	data, err := base64.StdEncoding.DecodeString(cipherText)
+	if err != nil {
+		return "", err
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+
+	blockSize := block.BlockSize()
+	if len(data) < blockSize {
+		return "", fmt.Errorf("cipher text too short")
+	}
+
+	iv := data[:blockSize]
+	data = data[blockSize:]
+
+	if len(data)%blockSize != 0 {
+		return "", fmt.Errorf("cipher text is not a multiple of the block size")
+	}
+
+	mode := cipher.NewCBCDecrypter(block, iv)
+	mode.CryptBlocks(data, data)
+
+	data, err = pkcs7Unpadding(data)
+	if err != nil {
+		return "", err
+	}
+
+	return string(data), nil
+}
+
+func reedsolomonEncode(data []byte) []byte {
+	// 设置编码参数
+	// 数据块大小
+	dataShards := 8
+	// 冗余块大小 (parity shards)
+	parityShards := 4
+	//totalShards := dataShards + parityShards
+
+	// 创建 Reed-Solomon 编码器
+	enc, err := reedsolomon.New(dataShards, parityShards)
+	if err != nil {
+		logger.Error.Printf("Error creating Reed-Solomon encoder: %v", err)
+	}
+
+	// 编码
+	// 创建一个新的切片，大小为 n 个数据块
+	blocks, err := enc.Split(data)
+	if err != nil {
+		logger.Error.Printf("Error splitting data into blocks: %v", err)
+	}
+
+	// 对数据块生成冗余块
+	err = enc.Encode(blocks)
+	if err != nil {
+		logger.Error.Printf("Error encoding blocks: %v", err)
+	}
+
+	// 将数据和冗余块拼接在一起
+	var encodedData []byte
+	for _, block := range blocks {
+		encodedData = append(encodedData, block...)
+	}
+	return encodedData
+}
+
+// 分段加密
+func rsaEncryptChunks(pubKey *rsa.PublicKey, data []byte) ([]byte, error) {
+	// 切割数据为多个块
+	var encryptedData []byte
+	for i := 0; i < len(data); i += maxBlockSize {
+		end := i + maxBlockSize
+		if end > len(data) {
+			end = len(data)
+		}
+
+		block := data[i:end]
+		encryptedBlock, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, pubKey, block, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		// 拼接加密块
+		encryptedData = append(encryptedData, encryptedBlock...)
+	}
+	return encryptedData, nil
 }
 
 func replayChaincodeEvents(ctx context.Context, network *client.Network, startBlock uint64) {

@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net"
+	"strings"
 )
 
 const (
@@ -63,17 +64,23 @@ func receiveMessages(conn net.Conn) {
 
 		// 读取消息内容
 		buffer := make([]byte, messageLength)
-		_, err = conn.Read(buffer)
-		if err != nil {
-			logger.Error.Printf("Error reading message content: %v", err)
-			return
+		totalRead := 0
+		for totalRead < int(messageLength) {
+			n, err := conn.Read(buffer[totalRead:])
+			if err != nil {
+				logger.Error.Printf("Error reading message content: %v", err)
+				return
+			}
+			totalRead += n
 		}
-
+		if strings.Contains(string(buffer), "\x00") {
+			panic("Message contains null byte (\\x00)")
+		}
 		var message Message
 		err = json.Unmarshal(buffer, &message)
 		if err != nil {
 			logger.Error.Printf("Error unmarshaling message: %v", err)
-			return
+			panic(err)
 		}
 
 		switch message.Type {
@@ -84,6 +91,7 @@ func receiveMessages(conn net.Conn) {
 				logger.Error.Printf("Error decoding base64 encrypteddata: %v", err)
 				panic(err)
 			}
+			ch <- true
 		case PublicKeyType:
 			logger.Info.Printf("Received pk message from Seller")
 			block, _ := pem.Decode([]byte(message.Content))

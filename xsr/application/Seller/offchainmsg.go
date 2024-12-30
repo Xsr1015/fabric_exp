@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"net"
+	"strings"
 )
 
 const (
@@ -49,7 +50,8 @@ func receiveMessages(conn net.Conn) {
 		case EncryptedDataType:
 			logger.Info.Printf("Received encrypted data message from Buyer")
 		case PublicKeyType:
-			logger.Info.Printf("Received public key message from Buyer")
+			logger.Info.Printf("Received key message from Buyer")
+			keyforsupervision = []byte(message.Content)
 		case StakeReturnType:
 			logger.Info.Printf("Received stake return message from Buyer")
 		case TxWithdrawType:
@@ -66,6 +68,9 @@ func sendMessageToBuyer(conn net.Conn, message Message) {
 	if err != nil {
 		logger.Error.Printf("Error marshalling message: %v", err)
 		return
+	}
+	if strings.Contains(string(messageData), "\x00") {
+		panic("Message contains null byte (\\x00)")
 	}
 
 	// 计算消息长度

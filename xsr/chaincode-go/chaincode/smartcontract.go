@@ -49,6 +49,12 @@ type Transaction struct {
 	Finished  bool   `json:"finished"`  //Whether the tx is finished
 }
 
+type SupervisionTx struct {
+	SID  string `json:"id"`
+	TXID string `json:"txid"`
+	Key  string `json:"key"`
+}
+
 // InitLedger adds a base set of accounts to the ledger
 func (s *SmartContract) InitLedger(ctx contractapi.TransactionContextInterface) error {
 	accounts := []Account{
@@ -492,6 +498,10 @@ func (s *SmartContract) GetMoney(ctx contractapi.TransactionContextInterface, id
 		return fmt.Errorf("unmarshal tx err. %v", err)
 	}
 
+	if tx.Finished {
+		return fmt.Errorf("the transaction is finished")
+	}
+
 	block, _ := pem.Decode([]byte(secretkey))
 	if block == nil {
 		return fmt.Errorf("failed to decode PEM block containing the private key")
@@ -830,4 +840,43 @@ func (s *SmartContract) DeleteAllAssets(ctx contractapi.TransactionContextInterf
 	}
 
 	return nil
+}
+
+// CreateSupervision issues a new supervision to the world state with given details.
+func (s *SmartContract) CreateSupervision(ctx contractapi.TransactionContextInterface, txid string, key string) error {
+	supervisiontx := SupervisionTx{
+		SID:  txid + "-supervision",
+		TXID: txid,
+		Key:  key,
+	}
+	supervisionJSON, err := json.Marshal(supervisiontx)
+	if err != nil {
+		return err
+	}
+	err = ctx.GetStub().PutState(txid+"-supervision", supervisionJSON)
+	if err != nil {
+		return fmt.Errorf("failed to put to world state. %v", err)
+	}
+
+	ctx.GetStub().SetEvent("CreateSupervision", supervisionJSON)
+	return nil
+}
+
+// ReadSupervision returns the supervision key stored in the world state with given id.
+func (s *SmartContract) ReadSupervision(ctx contractapi.TransactionContextInterface, sid string) (string, error) {
+	supervisionJSON, err := ctx.GetStub().GetState(sid)
+	if err != nil {
+		return "", fmt.Errorf("failed to read from world state: %v", err)
+	}
+	if supervisionJSON == nil {
+		return "", fmt.Errorf("the supervision %s does not exist", sid)
+	}
+
+	var supervisiontx SupervisionTx
+	err = json.Unmarshal(supervisionJSON, &supervisiontx)
+	if err != nil {
+		return "", err
+	}
+
+	return supervisiontx.Key, nil
 }
