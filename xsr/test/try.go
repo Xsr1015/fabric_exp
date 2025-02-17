@@ -2,15 +2,16 @@ package main
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
 	"io"
-	"log"
-
-	"github.com/klauspost/reedsolomon"
+	"time"
 )
 
 // PKCS7 填充
@@ -93,80 +94,26 @@ func aesDecrypt(cipherText string, key []byte) (string, error) {
 }
 
 func main() {
-	key := []byte("thisis32bitlongpassphrase!!!!!!!") // 32 字节密钥
-	plainText := "Hello, this is a secret message!"
-
-	// 加密
-	encrypted, err := aesEncrypt([]byte(plainText), key)
+	data := []byte("这是一个需要签名的重要消息")
+	hashedData := sha256.Sum256(data)
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		fmt.Printf("Encryption failed: %v\n", err)
-		return
+		panic(err)
 	}
-	fmt.Printf("Encrypted: %s\n", encrypted)
-
-	// 解密
-	decrypted, err := aesDecrypt(encrypted, key)
+	currentTime := time.Now()
+	formattedTime := currentTime.Format("2006-01-02 15:04:05.000000")
+	fmt.Println("Current Time with Microseconds: ", formattedTime)
+	// 使用私钥创建签名
+	signature, err := rsa.SignPKCS1v15(rand.Reader, privateKey, crypto.SHA256, hashedData[:])
 	if err != nil {
-		fmt.Printf("Decryption failed: %v\n", err)
-		return
+		panic(err)
 	}
-	fmt.Printf("Decrypted: %s\n", decrypted)
-
-	//reed-solomon
-	// 输入数据 (可以是任何数据，比如字符串或者字节)
-	data := []byte("thisis32bitlongpassphrase!!!!!!!")
-
-	// 设置编码参数
-	// 数据块大小
-	dataShards := 8
-	// 冗余块大小 (parity shards)
-	parityShards := 4
-	//totalShards := dataShards + parityShards
-
-	// 创建 Reed-Solomon 编码器
-	enc, err := reedsolomon.New(dataShards, parityShards)
+	publicKey := privateKey.PublicKey
+	err = rsa.VerifyPKCS1v15(&publicKey, crypto.SHA256, hashedData[:], signature)
 	if err != nil {
-		log.Fatalf("Error creating Reed-Solomon encoder: %v", err)
+		panic(err)
 	}
-
-	// 编码
-	// 创建一个新的切片，大小为 n 个数据块
-	blocks, err := enc.Split(data)
-	if err != nil {
-		log.Fatalf("Error splitting data into blocks: %v", err)
-	}
-
-	// 对数据块生成冗余块
-	err = enc.Encode(blocks)
-	if err != nil {
-		log.Fatalf("Error encoding blocks: %v", err)
-	}
-
-	// 将数据和冗余块拼接在一起
-	var encodedData []byte
-	for _, block := range blocks {
-		encodedData = append(encodedData, block...)
-	}
-
-	// 模拟错误：丢弃某些数据块
-	// 在此例中，我们丢弃了第二个数据块（索引为 1）
-	blocks[1] = nil // 丢弃数据块
-
-	// 解码：尝试恢复丢失的数据块
-	// 如果丢失的数据量不超过冗余块数量，就能恢复
-	err = enc.Reconstruct(blocks)
-	if err != nil {
-		log.Fatalf("Error decoding blocks: %v", err)
-	}
-
-	// 将解码后的数据重新组合成最终数据
-	var decodedData []byte
-	for _, block := range blocks[:dataShards] {
-		decodedData = append(decodedData, block...)
-	}
-
-	// 打印结果
-	fmt.Printf("Original Data: %s\n", data)
-	fmt.Printf("Encoded Data (with redundancy): %x\n", encodedData)
-	fmt.Printf("Decoded Data: %s\n", decodedData)
+	currentTime = time.Now()
+	formattedTime = currentTime.Format("2006-01-02 15:04:05.000000")
+	fmt.Println("Current Time with Microseconds: ", formattedTime)
 }

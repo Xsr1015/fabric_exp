@@ -44,7 +44,7 @@ The test network is deployed with two peer organizations. The `createChannel` fl
 
 
 
-You can use the test network script to deploy the ERC-20 token contract to the channel that was just created. Deploy the smart contract to `mychannel` using the following command:
+You can use the test network script to deploy the 'xsr' contract to the channel that was just created. Deploy the smart contract to `mychannel` using the following command:
 
 **For a Go Contract:**
 
@@ -58,5 +58,3 @@ You can use the test network script to deploy the ERC-20 token contract to the c
 
 Your Go chaincode depends on Go packages (like the chaincode shim) that are not part of the standard library. The source to these packages must be included in your chaincode package when it is installed to a peer. If you have structured your chaincode as a module, the easiest way to do this is to “vendor” the dependencies with `go mod vendor` before packaging your chaincode. 
 
-
-实验：和Strawman的对比，两种撤回方式，是否有监管。
